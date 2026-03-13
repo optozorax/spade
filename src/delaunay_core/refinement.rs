@@ -484,11 +484,7 @@ where
         encroached_segment_candidates.extend(
             self.undirected_edges()
                 .filter(|edge| {
-                    if parameters.keep_constraint_edges {
-                        edge.is_part_of_convex_hull()
-                    } else {
-                        Self::is_fixed_edge(*edge)
-                    }
+                    Self::is_encroachment_resolution_edge(*edge, parameters.keep_constraint_edges)
                 })
                 .map(|edge| edge.fix()),
         );
@@ -546,6 +542,7 @@ where
                     &mut constraint_edge_map,
                     forcibly_split_segment,
                     &mut excluded_faces,
+                    parameters.keep_constraint_edges,
                 ) {
                     // Re-processing the last skinny triangle only makes sense if the encroachment
                     // could actually be resolved. Otherwise, we'd retry the same failed split and
@@ -584,6 +581,7 @@ where
                                 &mut constraint_edge_map,
                                 segment_candidate,
                                 &mut excluded_faces,
+                                parameters.keep_constraint_edges,
                             );
                         }
                     }
@@ -756,6 +754,13 @@ where
         edge.is_constraint_edge() || edge.is_part_of_convex_hull()
     }
 
+    fn is_encroachment_resolution_edge(
+        edge: UndirectedEdgeHandle<V, DE, CdtEdge<UE>, F>,
+        keep_constraint_edges: bool,
+    ) -> bool {
+        edge.is_part_of_convex_hull() || (!keep_constraint_edges && edge.is_constraint_edge())
+    }
+
     fn resolve_encroachment(
         &mut self,
         encroached_segments_buffer: &mut VecDeque<FixedUndirectedEdgeHandle>,
@@ -763,6 +768,7 @@ where
         constraint_edge_map: &mut HashMap<FixedVertexHandle, [FixedVertexHandle; 2]>,
         encroached_edge: FixedUndirectedEdgeHandle,
         excluded_faces: &mut HashSet<FixedFaceHandle<InnerTag>>,
+        keep_constraint_edges: bool,
     ) -> bool {
         // Resolves an encroachment by splitting the encroached edge. Since this reduces the diametral circle, this will
         // eventually get rid of the encroachment completely.
@@ -879,13 +885,19 @@ where
                 .out_edges()
                 .filter(|edge| !edge.is_outer_edge())
                 .map(|edge| edge.next().as_undirected())
-                .filter(|edge| Self::is_fixed_edge(*edge))
+                .filter(|edge| Self::is_encroachment_resolution_edge(*edge, keep_constraint_edges))
                 .map(|edge| edge.fix()),
         );
 
         // Update encroachment candidates - any of the resulting edges may still be in an encroaching state.
-        encroached_segments_buffer.push_back(e1.as_undirected());
-        encroached_segments_buffer.push_back(e2.as_undirected());
+        for edge in [e1.as_undirected(), e2.as_undirected()] {
+            if Self::is_encroachment_resolution_edge(
+                self.undirected_edge(edge),
+                keep_constraint_edges,
+            ) {
+                encroached_segments_buffer.push_back(edge);
+            }
+        }
 
         true
     }
@@ -1273,6 +1285,20 @@ mod test {
             result.refinement_complete,
             "Refinement ran out of additional vertices for regression input"
         );
+
+        let mut missing = Vec::new();
+        for edge in &constraints {
+            let from = FixedVertexHandle::from_index(edge[0]);
+            let to = FixedVertexHandle::from_index(edge[1]);
+            if !cdt.exists_constraint(from, to) {
+                missing.push(*edge);
+            }
+        }
+        assert!(
+            missing.is_empty(),
+            "Refinement lost constraint edges: {missing:?}"
+        );
+
         cdt.cdt_sanity_check();
 
         Ok(())
