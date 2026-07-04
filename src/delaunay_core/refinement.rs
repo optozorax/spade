@@ -146,6 +146,12 @@ enum RefinementHint {
     MustRefine,
 }
 
+/// Spatially varying sizing function: maps a triangle (given by its three vertex positions
+/// in counterclockwise order) to the maximum allowed area for that triangle.
+///
+/// *See [ConstrainedDelaunayTriangulation::refine_with_sizing]*
+type MaxAreaSizing<'a, S> = &'a dyn Fn([Point2<S>; 3]) -> S;
+
 /// Controls how Delaunay refinement is performed.
 ///
 /// Refer to [ConstrainedDelaunayTriangulation::refine] and methods implemented by this type for more details
@@ -324,11 +330,17 @@ impl<S: SpadeNum + Float> RefinementParameters<S> {
     fn get_refinement_hint<V, DE, UE, F>(
         &self,
         face: FaceHandle<InnerTag, V, DE, UE, F>,
+        max_area_sizing: Option<MaxAreaSizing<'_, S>>,
     ) -> RefinementHint
     where
         V: HasPosition<Scalar = S>,
     {
-        if let Some(max_area) = self.max_area {
+        let max_area = match max_area_sizing {
+            Some(sizing) => Some(sizing(face.positions())),
+            None => self.max_area,
+        };
+
+        if let Some(max_area) = max_area {
             if face.area() > max_area {
                 return RefinementHint::MustRefine;
             }
@@ -461,6 +473,91 @@ where
     #[doc(alias = "Refinement")]
     #[doc(alias = "Delaunay Refinement")]
     pub fn refine(&mut self, parameters: RefinementParameters<V::Scalar>) -> RefinementResult {
+        self.refine_impl(parameters, None)
+    }
+
+    /// Refines the triangulation like [refine](Self::refine), but with a *spatially varying*
+    /// maximum allowed triangle area.
+    ///
+    /// Instead of the global constant configured with
+    /// [with_max_allowed_area](RefinementParameters::with_max_allowed_area), the maximum
+    /// allowed area is queried from `max_area_sizing` individually for every triangle that is
+    /// considered for refinement. The function receives the positions of the triangle's three
+    /// vertices (in counterclockwise order) and returns the maximum allowed area for that
+    /// triangle. Returning `INFINITY` exempts the triangle from the area criterion.
+    ///
+    /// This allows different regions of the triangulation to be refined to different
+    /// resolutions in a single refinement pass, e.g. small triangles inside an area of
+    /// interest and arbitrarily large triangles far away from it. Sharp jumps in the sizing
+    /// function are fine - the angle criterion (see
+    /// [with_angle_limit](RefinementParameters::with_angle_limit)) creates a natural,
+    /// gradual transition between regions of different sizes.
+    ///
+    /// Any value configured with [with_max_allowed_area](RefinementParameters::with_max_allowed_area)
+    /// is ignored - the sizing function takes its place. All other parameters apply unchanged.
+    /// Refining with a constant function `|_| c` produces the same mesh as refining with
+    /// `with_max_allowed_area(c)`.
+    ///
+    /// # Choosing a sampling strategy
+    ///
+    /// For a smoothly varying sizing field, evaluating the field at the triangle's centroid
+    /// (the average of the three vertex positions) is a good default.
+    ///
+    /// For a *sharply bounded* fine region ("small triangles inside this box"), do not sample
+    /// the field at a single point: a triangle much larger than the region can cover it
+    /// entirely while its centroid and all three vertices lie outside, and it would never be
+    /// refined. Instead, return the fine bound for every triangle that *intersects* the
+    /// region, e.g. with a bounding box overlap test:
+    ///
+    /// ```
+    /// use spade::{ConstrainedDelaunayTriangulation, Point2, RefinementParameters, Triangulation};
+    ///
+    /// let mut cdt: ConstrainedDelaunayTriangulation<Point2<f64>> = Default::default();
+    /// for corner in [
+    ///     Point2::new(-10.0, -10.0),
+    ///     Point2::new(-10.0, 10.0),
+    ///     Point2::new(10.0, -10.0),
+    ///     Point2::new(10.0, 10.0),
+    /// ] {
+    ///     cdt.insert(corner)?;
+    /// }
+    ///
+    /// // Small triangles inside the unit square, arbitrarily large triangles outside.
+    /// cdt.refine_with_sizing(RefinementParameters::new(), |[a, b, c]: [Point2<f64>; 3]| {
+    ///     let overlaps_unit_square = a.x.max(b.x).max(c.x) > 0.0
+    ///         && a.x.min(b.x).min(c.x) < 1.0
+    ///         && a.y.max(b.y).max(c.y) > 0.0
+    ///         && a.y.min(b.y).min(c.y) < 1.0;
+    ///     if overlaps_unit_square {
+    ///         0.01
+    ///     } else {
+    ///         f64::INFINITY
+    ///     }
+    /// });
+    ///
+    /// # Ok::<(), spade::InsertionError>(())
+    /// ```
+    ///
+    /// # Termination
+    ///
+    /// Wherever the sizing function returns a finite value, that value should be bounded from
+    /// below by some positive constant - a sizing function approaching zero forces infinitely
+    /// small triangles and refinement will only stop once it runs out of additional vertices
+    /// (see [with_max_additional_vertices](RefinementParameters::with_max_additional_vertices),
+    /// which keeps working as a hard stop).
+    pub fn refine_with_sizing(
+        &mut self,
+        parameters: RefinementParameters<V::Scalar>,
+        max_area_sizing: impl Fn([Point2<V::Scalar>; 3]) -> V::Scalar,
+    ) -> RefinementResult {
+        self.refine_impl(parameters, Some(&max_area_sizing))
+    }
+
+    fn refine_impl(
+        &mut self,
+        parameters: RefinementParameters<V::Scalar>,
+        max_area_sizing: Option<MaxAreaSizing<'_, V::Scalar>>,
+    ) -> RefinementResult {
         use PositionInTriangulation::*;
 
         let mut excluded_faces = if parameters.exclude_outer_faces {
@@ -604,7 +701,7 @@ where
 
                 let (shortest_edge, _) = face.shortest_edge();
 
-                let refinement_hint = parameters.get_refinement_hint(face);
+                let refinement_hint = parameters.get_refinement_hint(face, max_area_sizing);
 
                 if refinement_hint == RefinementHint::Ignore {
                     // Triangle is fine as is and can be skipped
@@ -1250,6 +1347,144 @@ mod test {
         cdt.refine(Default::default());
         cdt.cdt_sanity_check();
 
+        Ok(())
+    }
+
+    #[test]
+    fn test_constant_sizing_matches_constant_max_area() -> Result<(), InsertionError> {
+        let max_area = 0.05;
+
+        let build = || -> Result<Cdt, InsertionError> {
+            let mut cdt = Cdt::bulk_load(random_points_with_seed(30, SEED))?;
+            cdt.add_constraint_edges(test_shape().iter().map(|p| p.mul(2.0)), true)?;
+            Ok(cdt)
+        };
+
+        let mut cdt_constant = build()?;
+        let mut cdt_sizing = build()?;
+
+        cdt_constant.refine(RefinementParameters::new().with_max_allowed_area(max_area));
+        cdt_sizing.refine_with_sizing(RefinementParameters::new(), |_| max_area);
+
+        assert_eq!(cdt_constant.num_vertices(), cdt_sizing.num_vertices());
+        assert_eq!(cdt_constant.num_inner_faces(), cdt_sizing.num_inner_faces());
+        for (v0, v1) in cdt_constant.vertices().zip(cdt_sizing.vertices()) {
+            assert_eq!(v0.position(), v1.position());
+        }
+
+        cdt_sizing.cdt_sanity_check_with_params(false);
+        Ok(())
+    }
+
+    #[test]
+    fn test_adversarial_zero_sizing_terminates() -> Result<(), InsertionError> {
+        let mut cdt = Cdt::new();
+        cdt.add_constraint_edges(test_shape(), true)?;
+
+        let result = cdt.refine_with_sizing(
+            RefinementParameters::new().with_max_additional_vertices(300),
+            |_| 0.0,
+        );
+
+        assert!(!result.refinement_complete);
+        cdt.cdt_sanity_check_with_params(false);
+        Ok(())
+    }
+
+    #[test]
+    fn test_spatially_varying_sizing() -> Result<(), InsertionError> {
+        let max_area = 0.4 * 0.1 * 0.1;
+        let inside_unit_square =
+            |p: Point2<f64>| p.x > 0.0 && p.x < 1.0 && p.y > 0.0 && p.y < 1.0;
+
+        // Domain corners far away from the unit square, mimicking an "open space" boundary.
+        let mut cdt = Cdt::new();
+        for corner in [
+            Point2::new(-10.0, -10.0),
+            Point2::new(-10.0, 11.0),
+            Point2::new(11.0, -10.0),
+            Point2::new(11.0, 11.0),
+        ] {
+            cdt.insert(corner)?;
+        }
+
+        // A constraint polyline running from inside the unit square towards the outer
+        // boundary, discretized finely inside the fine region and increasingly coarse
+        // outside of it (matching how such inputs are meshed in practice - with
+        // `keep_constraint_edges`, segment lengths must be compatible with the local
+        // target triangle size).
+        let mut polyline_xs = alloc::vec![];
+        let mut x = 0.5;
+        let mut step = 0.02;
+        while x < 10.5 {
+            polyline_xs.push(x);
+            if x >= 1.0 {
+                step *= 2.0;
+            }
+            x += step;
+        }
+        polyline_xs.push(10.5);
+
+        let polyline_handles = polyline_xs
+            .iter()
+            .map(|&x| cdt.insert(Point2::new(x, 0.5)))
+            .collect::<Result<Vec<_>, _>>()?;
+        for pair in polyline_handles.windows(2) {
+            cdt.add_constraint(pair[0], pair[1]);
+        }
+
+        let result = cdt.refine_with_sizing(
+            RefinementParameters::new()
+                .keep_constraint_edges()
+                .with_max_additional_vertices(100_000),
+            |[a, b, c]: [Point2<f64>; 3]| {
+                // Overlap test: any triangle intersecting the unit square gets the fine
+                // bound, so even huge triangles covering the whole square are refined.
+                let overlaps = a.x.max(b.x).max(c.x) > 0.0
+                    && a.x.min(b.x).min(c.x) < 1.0
+                    && a.y.max(b.y).max(c.y) > 0.0
+                    && a.y.min(b.y).min(c.y) < 1.0;
+                if overlaps {
+                    max_area
+                } else {
+                    f64::INFINITY
+                }
+            },
+        );
+
+        assert!(result.refinement_complete);
+        for pair in polyline_handles.windows(2) {
+            assert!(cdt.exists_constraint(pair[0], pair[1]));
+        }
+
+        let mut faces_inside = 0;
+        let mut faces_outside = 0;
+        for face in cdt.inner_faces() {
+            if inside_unit_square(face.center()) {
+                faces_inside += 1;
+                assert!(
+                    face.area() <= max_area,
+                    "face at {:?} too large: {} > {}",
+                    face.center(),
+                    face.area(),
+                    max_area
+                );
+            } else {
+                faces_outside += 1;
+            }
+        }
+
+        // The unit square has area 1, so the bound forces at least 1 / max_area = 250 faces
+        // (modulo boundary effects). The outside region must stay coarse - the angle
+        // criterion alone needs only a moderate amount of faces for the grading.
+        assert!(faces_inside > 100, "too few fine faces: {}", faces_inside);
+        assert!(
+            faces_outside < 10_000,
+            "outer region over-refined: {} faces",
+            faces_outside
+        );
+
+        cdt.cdt_sanity_check_with_params(false);
         Ok(())
     }
 
